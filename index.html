@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gesto Detektor – Ukazováček</title>
+
+  <style>
+    /* ============================================================
+       ZÁKLADNÍ RESET A LAYOUT
+       Cíl: zobrazit video stream přesně na velikost kamery,
+       vystředit ho na obrazovce a připravit kontejner, do kterého
+       se vykresluje i ladicí canvas a meme overlay.
+       ============================================================ */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1115;
+      color: #f5f5f5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      gap: 16px;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-align: center;
+    }
+
+    p.subtitle {
+      font-size: 0.9rem;
+      color: #9aa0ac;
+      text-align: center;
+      max-width: 480px;
+    }
+
+    /* Kontejner pro video + canvas + meme overlay.
+       position: relative umožňuje, aby canvas a meme byly
+       absolutně umístěny přesně přes video. */
+    #stage {
+      position: relative;
+      width: 640px;
+      max-width: 100%;
+      aspect-ratio: 4 / 3;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #000;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    /* Video je zrcadlené (mirror), aby se uživatel viděl
+       jako v zrcadle – přirozenější pro gesta. */
+    #video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    /* Canvas pro vykreslení landmarků ruky (debug vrstva).
+       Musí mít stejný transform jako video, jinak by
+       landmarky byly zrcadlově otočené oproti obrazu. */
+    #overlayCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1);
+      pointer-events: none;
+    }
+
+    /* MEME OVERLAY – vysoký z-index, fade-in animace.
+       Skryto pomocí opacity (ne display: none), aby
+       fade-in/out tranzice fungovala plynule. */
+    #memeOverlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(10, 10, 14, 0.55);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.35s ease;
+      z-index: 50;
+    }
+
+    #memeOverlay.visible {
+      opacity: 1;
+    }
+
+    #memeOverlay img {
+      max-width: 60%;
+      max-height: 60%;
+      border-radius: 12px;
+      box-shadow: 0 0 40px rgba(255, 255, 255, 0.25);
+      /* drobné "pop" zvětšení při zobrazení */
+      transform: scale(0.85);
+      transition: transform 0.35s ease;
+    }
+
+    #memeOverlay.visible img {
+      transform: scale(1);
+    }
+
+    /* STATUS BADGE – informuje o stavu detekce / kamery */
+    #status {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      z-index: 40;
+      backdrop-filter: blur(4px);
+    }
+
+    /* OVLÁDACÍ PANEL – tlačítko Start (audio context) + Spotify embed */
+    #controls {
+      width: 640px;
+      max-width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #startBtn {
+      background: #1db954; /* Spotify zelená – signál pro audio start */
+      color: #0f1115;
+      border: none;
+      padding: 12px 28px;
+      font-size: 1rem;
+      font-weight: 600;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    #startBtn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 16px rgba(29, 185, 84, 0.4);
+    }
+
+    #startBtn:active {
+      transform: translateY(0);
+    }
+
+    #startBtn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    #spotifyEmbed {
+      width: 100%;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .hint {
+      font-size: 0.78rem;
+      color: #6b7280;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Detekce gesta: zvednutý ukazováček ☝️</h1>
+  <p class="subtitle">
+    Aplikace sleduje obraz z webkamery. Když po dobu delší než 300&nbsp;ms
+    detekuje gesto „zvednutý ukazováček, ostatní prsty schované“, spustí
+    hudbu na Spotify a zobrazí přes obraz animovaný meme overlay.
+  </p>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlayCanvas"></canvas>
+
+    <!-- Meme overlay – obrázek se přednahraje do paměti hned na startu,
+         takže se po detekci zobrazí bez prodlevy. Soubor meme.png si
+         vlož do stejné složky jako tento index.html. -->
+    <div id="memeOverlay">
+      <img id="memeImg" src="meme.png" alt="Meme overlay" />
+    </div>
+
+    <div id="status">Inicializace kamery…</div>
+  </div>
+
+  <div id="controls">
+    <!-- Tlačítko Start řeší autoplay policy prohlížečů:
+         bez interakce uživatele nelze spustit zvuk/Spotify embed. -->
+    <button id="startBtn">▶ Start (povolit zvuk a kameru)</button>
+
+    <!-- Kontejner, do kterého se dynamicky vloží Spotify iFrame
+         pomocí oficiálního Spotify iFrame API. -->
+    <div id="spotifyEmbed"></div>
+
+    <p class="hint">
+      Pro spuštění na lokálu použij Live Server (viz instrukce dole na stránce
+      nebo v přiloženém README).
+    </p>
+  </div>
+
+  <!-- ============================================================
+       EXTERNÍ KNIHOVNY (CDN)
+       - MediaPipe Hands: model pro detekci ruky a 21 landmarků
+       - Drawing utils + camera utils: pomocné nástroje pro
+         vykreslování landmarků a zpracování video streamu
+       - Spotify iFrame API: pro programové ovládání embed přehrávače
+       ============================================================ -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
+
+  <script>
+    /* ============================================================
+       BLOK 1: GLOBÁLNÍ STAV A REFERENCE NA DOM ELEMENTY
+       ============================================================ */
+    const videoEl = document.getElementById('video');
+    const canvasEl = document.getElementById('overlayCanvas');
+    const canvasCtx = canvasEl.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const memeOverlay = document.getElementById('memeOverlay');
+    const memeImg = document.getElementById('memeImg');
+    const startBtn = document.getElementById('startBtn');
+
+    // Spotify track ID získaný z URL ze zadání
+    const SPOTIFY_TRACK_ID = '3ujkV9XNpAMOYx4qoG6uUM';
+
+    // Doba (ms), po kterou musí gesto trvat nepřetržitě,
+    // než se spustí akce – eliminace falešných pozitiv.
+    const GESTURE_HOLD_MS = 300;
+
+    // Časové razítko, kdy gesto začalo být detekováno (null = není aktivní)
+    let gestureStartTime = null;
+
+    // Příznak, zda už byla akce v rámci aktuálního "držení" gesta spuštěna,
+    // aby se akce nespouštěla opakovaně každý snímek po překročení 300 ms.
+    let actionTriggered = false;
+
+    // Reference na Spotify embed controller (naplní se po načtení API)
+    let spotifyController = null;
+
+    // Příznak, zda uživatel již klikl na Start (audio context povolen)
+    let userReady = false;
+
+    /* ============================================================
+       BLOK 2: PŘEDNAČTENÍ MEME OBRÁZKU DO PAMĚTI
+       Cíl: aby se overlay po detekci zobrazil okamžitě, bez čekání
+       na síťové stažení obrázku. Vytvoříme Image objekt mimo DOM,
+       prohlížeč si jej uloží do cache, a element #memeImg pak jen
+       odkazuje na stejnou URL (= žádný další request).
+       ============================================================ */
+    function preloadMemeImage() {
+      const preload = new Image();
+      preload.src = memeImg.src; // 'meme.png' – vlastní soubor v projektu
+      // Žádná další akce potřeba – browser cache zajistí rychlé zobrazení.
+    }
+    preloadMemeImage();
+
+    /* ============================================================
+       BLOK 3: INICIALIZACE KAMERY
+       Cíl: požádat o přístup ke kameře (a mikrofonu – kvůli zadání
+       "kamera a zvuk"), navázat stream na <video> element.
+       Mikrofon samotný v této appce nepoužíváme pro detekci,
+       ale getUserMedia s audio:true splní požadavek na oprávnění
+       k mikrofonu (např. pro budoucí rozšíření / indikaci v UI).
+       ============================================================ */
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' },
+          audio: true
+        });
+
+        videoEl.srcObject = stream;
+
+        // Čekáme, až má video skutečné rozměry, abychom mohli
+        // nastavit canvas na stejnou velikost (jinak by landmarky
+        // byly špatně zarovnané).
+        await new Promise((resolve) => {
+          videoEl.onloadedmetadata = () => resolve();
+        });
+
+        canvasEl.width = videoEl.videoWidth;
+        canvasEl.height = videoEl.videoHeight;
+
+        statusEl.textContent = 'Kamera OK – načítám MediaPipe model…';
+        return true;
+      } catch (err) {
+        // Časté důvody chyby: uživatel odmítl oprávnění, žádná kamera,
+        // nebo stránka neběží přes HTTPS/localhost (povinné pro getUserMedia).
+        statusEl.textContent = 'Chyba kamery: ' + err.message;
+        console.error('getUserMedia error:', err);
+        return false;
+      }
+    }
+
+    /* ============================================================
+       BLOK 4: INICIALIZACE MEDIAPIPE HANDS
+       Cíl: vytvořit instanci modelu Hands, nastavit parametry
+       (max. 1 ruka pro výkon, confidence thresholdy pro robustnost
+       v různých světelných podmínkách) a napojit callback onResults.
+
+       MediaPipe Hands vrací pro každou detekovanou ruku 21 landmarků
+       (bodů) s normalizovanými souřadnicemi x, y, z v rozsahu 0–1.
+       Index landmarků (klíčové pro náš výpočet gesta):
+         0  – zápěstí (wrist)
+         4  – konec palce (thumb tip)
+         8  – konec ukazováčku (index finger tip)
+         5  – kloub ukazováčku (index finger MCP)
+         12 – konec prostředníčku (middle finger tip)
+         9  – kloub prostředníčku (middle finger MCP)
+         16 – konec prsteníčku (ring finger tip)
+         13 – kloub prsteníčku (ring finger MCP)
+         20 – konec malíčku (pinky tip)
+         17 – kloub malíčku (pinky MCP)
+       ============================================================ */
+    function createHandsModel() {
+      const hands = new Hands({
+        // locateFile říká MediaPipe, odkud stahovat .wasm a model soubory
+        locateFile: (file) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+
+      hands.setOptions({
+        maxNumHands: 1,           // detekujeme jen jednu ruku – šetří výkon
+        modelComplexity: 1,       // 0 = lite, 1 = full (lepší přesnost)
+        minDetectionConfidence: 0.7, // vyšší práh = méně falešných detekcí
+        minTrackingConfidence: 0.7   // stabilnější sledování mezi snímky
+      });
+
+      hands.onResults(onHandsResults);
+      return hands;
+    }
+
+    /* ============================================================
+       BLOK 5: VÝPOČETNÍ LOGIKA GESTA – "zvednutý ukazováček"
+       ============================================================
+       Princip detekce "zdvižený prst" vs "skrčený prst":
+       Pro každý prst porovnáváme vzdálenost špičky prstu (tip)
+       od zápěstí (landmark 0) se vzdáleností odpovídajícího
+       kloubu (MCP / PIP) od zápěstí.
+
+       - Pokud je špička prstu výrazně DÁL od zápěstí než její
+         "základní" kloub → prst je VYTAŽENÝ (extended).
+       - Pokud je špička BLÍŽ nebo na podobné vzdálenosti jako
+         kloub → prst je SKRČENÝ (curled).
+
+       Tento přístup (porovnání vzdáleností od zápěstí, nikoli
+       jen souřadnice y) je robustní vůči natočení ruky a různým
+       úhlům kamery, a nezávisí na barvě/jasu obrazu (pracujeme
+       čistě s geometrií bodů) → odolné vůči světelným podmínkám.
+
+       Gesto "zvednutý ukazováček":
+         - index (ukazováček) = extended
+         - middle, ring, pinky = curled
+         - thumb (palec) = curled (blízko dlaně)
+       ============================================================ */
+
+    // Pomocná funkce: euklidovská vzdálenost mezi dvěma landmarky
+    // (počítáme v 2D – x, y; souřadnice jsou normalizované 0–1)
+    function dist(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // Vrátí true, pokud je daný prst "vytažený" (extended)
+    function isFingerExtended(landmarks, tipIdx, baseIdx, wristIdx = 0) {
+      const wrist = landmarks[wristIdx];
+      const tip = landmarks[tipIdx];
+      const base = landmarks[baseIdx];
+
+      const tipToWrist = dist(tip, wrist);
+      const baseToWrist = dist(base, wrist);
+
+      // Faktor 1.1 = malá rezerva (hysterese), aby drobný šum
+      // v detekci neznamenal náhodné přepínání stavu prstu.
+      return tipToWrist > baseToWrist * 1.1;
+    }
+
+    // Speciální logika pro palec – palec se neohýbá stejně jako
+    // ostatní prsty (pohybuje se víc do strany než nahoru/dolů),
+    // proto porovnáváme jeho špičku (4) s kloubem (2) vůči
+    // kloubu ukazováčku (5), který slouží jako referenční bod
+    // "blízkosti dlaně".
+    function isThumbCurled(landmarks) {
+      const thumbTip = landmarks[4];
+      const indexMcp = landmarks[5];
+      const wrist = landmarks[0];
+
+      const thumbToIndexMcp = dist(thumbTip, indexMcp);
+      const wristToIndexMcp = dist(wrist, indexMcp);
+
+      // Pokud je špička palce blízko kloubu ukazováčku
+      // (relativně k velikosti dlaně), považujeme palec za skrčený.
+      return thumbToIndexMcp < wristToIndexMcp * 0.85;
+    }
+
+    // Hlavní funkce: vrací true, pokud landmarky odpovídají
+    // gestu "zvednutý ukazováček, ostatní prsty skrčené"
+    function isIndexFingerGesture(landmarks) {
+      const indexExtended  = isFingerExtended(landmarks, 8, 5);
+      const middleExtended = isFingerExtended(landmarks, 12, 9);
+      const ringExtended   = isFingerExtended(landmarks, 16, 13);
+      const pinkyExtended  = isFingerExtended(landmarks, 20, 17);
+      const thumbCurled    = isThumbCurled(landmarks);
+
+      return (
+        indexExtended &&
+        !middleExtended &&
+        !ringExtended &&
+        !pinkyExtended &&
+        thumbCurled
+      );
+    }
+
+    /* ============================================================
+       BLOK 6: CALLBACK PRO VÝSLEDKY MEDIAPIPE (onResults)
+       Cíl:
+         1. Vykreslit aktuální video snímek + landmarky na canvas
+            (vizuální feedback pro uživatele).
+         2. Spustit detekční logiku gesta.
+         3. Řešit časování (300 ms) a spouštění akcí.
+       ============================================================ */
+    function onHandsResults(results) {
+      // 1) Vykreslení snímku a landmarků na debug canvas
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        for (const landmarks of results.multiHandLandmarks) {
+          // drawConnectors a drawLandmarks pocházejí z @mediapipe/drawing_utils
+          drawConnectors(canvasCtx, landmarks, Hands.HAND_CONNECTIONS, {
+            color: '#1db954',
+            lineWidth: 2
+          });
+          drawLandmarks(canvasCtx, landmarks, {
+            color: '#ffffff',
+            lineWidth: 1,
+            radius: 3
+          });
+        }
+      }
+      canvasCtx.restore();
+
+      // 2) Detekce gesta
+      let gestureActiveNow = false;
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        gestureActiveNow = isIndexFingerGesture(landmarks);
+      }
+
+      // 3) Časování a spouštění akce (debounce 300 ms)
+      const now = performance.now();
+
+      if (gestureActiveNow) {
+        if (gestureStartTime === null) {
+          // Gesto právě začalo – zaznamenáme čas startu
+          gestureStartTime = now;
+        }
+
+        const heldFor = now - gestureStartTime;
+        statusEl.textContent = `Gesto detekováno (${Math.round(heldFor)} ms)`;
+
+        if (heldFor >= GESTURE_HOLD_MS && !actionTriggered) {
+          // Gesto drží dost dlouho a akce ještě neproběhla → SPUSTIT
+          actionTriggered = true;
+          triggerAction();
+        }
+      } else {
+        // Gesto skončilo / nebylo detekováno → reset stavu
+        gestureStartTime = null;
+        actionTriggered = false;
+        statusEl.textContent = 'Sleduji ruku…';
+
+        // Skrytí meme overlaye, pokud byl zobrazen
+        hideMeme();
+      }
+    }
+
+    /* ============================================================
+       BLOK 7: AKČNÍ REAKCE PO DETEKCI GESTA
+       - Zobrazí meme overlay (fade-in)
+       - Spustí přehrávání skrz Spotify iFrame API
+       ============================================================ */
+    function triggerAction() {
+      showMeme();
+      playSpotifyTrack();
+    }
+
+    function showMeme() {
+      memeOverlay.classList.add('visible');
+    }
+
+    function hideMeme() {
+      memeOverlay.classList.remove('visible');
+    }
+
+    /* ============================================================
+       BLOK 8: SPOTIFY EMBED IFRAME API
+       ============================================================
+       Postup:
+       1. Skript https://open.spotify.com/embed/iframe-api/v1 po
+          načtení zavolá globální funkci window.onSpotifyIframeApiReady
+          a předá jí IFrameAPI objekt.
+       2. Pomocí IFrameAPI.createController() vytvoříme embed
+          přehrávač uvnitř #spotifyEmbed a získáme "controller"
+          objekt, který má metody play() / pause() / loadUri().
+       3. Kvůli autoplay policy prohlížečů musí být controller.play()
+          zavolán až po interakci uživatele (kliknutí na #startBtn).
+          Proto controller jen připravíme, ale play() voláme
+          teprve v triggerAction() / po kliknutí na Start.
+       ============================================================ */
+    window.onSpotifyIframeApiReady = (IFrameAPI) => {
+      const element = document.getElementById('spotifyEmbed');
+      const options = {
+        uri: `spotify:track:${SPOTIFY_TRACK_ID}`,
+        width: '100%',
+        height: '152'
+      };
+
+      const callback = (controller) => {
+        spotifyController = controller;
+
+        controller.addListener('ready', () => {
+          statusEl.textContent = 'Spotify přehrávač připraven.';
+        });
+      };
+
+      IFrameAPI.createController(element, options, callback);
+    };
+
+    function playSpotifyTrack() {
+      if (spotifyController && userReady) {
+        spotifyController.play();
+      } else if (!userReady) {
+        // Pojistka: pokud uživatel zapomněl kliknout na Start,
+        // alespoň otevřeme skladbu v novém okně (fallback).
+        statusEl.textContent =
+          'Pro přehrání hudby nejprve klikni na tlačítko "Start".';
+      }
+    }
+
+    /* ============================================================
+       BLOK 9: TLAČÍTKO "START" – AKTIVACE AUDIO CONTEXTU
+       Kliknutí splní požadavek prohlížeče na "user gesture"
+       potřebný pro autoplay zvuku (Spotify embed i případný
+       budoucí Web Audio API zvuk).
+       ============================================================ */
+    startBtn.addEventListener('click', () => {
+      userReady = true;
+      startBtn.disabled = true;
+      startBtn.textContent = '✓ Audio povoleno';
+
+      // Krátké "zahřátí" Spotify controlleru – přehrát a hned
+      // zastavit, aby si prohlížeč zapsal, že audio bylo
+      // iniciováno gestem uživatele.
+      if (spotifyController) {
+        spotifyController.play();
+        spotifyController.pause();
+      }
+    });
+
+    /* ============================================================
+       BLOK 10: HLAVNÍ SMYČKA (requestAnimationFrame)
+       ============================================================
+       Cíl: posílat jednotlivé snímky videa do MediaPipe Hands
+       v plynulém tempu navázaném na vykreslovací frekvenci
+       prohlížeče (typicky 60 fps), bez blokování hlavního vlákna.
+
+       MediaPipe Hands.send() je asynchronní (vrací Promise),
+       ale my nečekáme na jeho dokončení v rámci smyčky – pouze
+       zajistíme, že nezavoláme send() znovu, dokud předchozí
+       volání neskončilo (ochrana proti zahlcení modelu na
+       slabším hardwaru).
+       ============================================================ */
+    let isProcessing = false;
+
+    async function frameLoop(hands) {
+      if (!isProcessing && videoEl.readyState >= 2) {
+        isProcessing = true;
+        try {
+          await hands.send({ image: videoEl });
+        } catch (err) {
+          console.error('MediaPipe send error:', err);
+        } finally {
+          isProcessing = false;
+        }
+      }
+      requestAnimationFrame(() => frameLoop(hands));
+    }
+
+    /* ============================================================
+       BLOK 11: BOOTSTRAP – SPUŠTĚNÍ CELÉ APLIKACE
+       ============================================================ */
+    (async function bootstrap() {
+      const cameraOk = await initCamera();
+      if (!cameraOk) return;
+
+      const hands = createHandsModel();
+      statusEl.textContent = 'Sleduji ruku…';
+
+      requestAnimationFrame(() => frameLoop(hands));
+    })();
+  </script>
+
+</body>
+</html>
